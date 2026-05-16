@@ -10,6 +10,12 @@ from pathlib import Path
 
 from services.account_service import account_service
 from services.config import DATA_DIR
+from services.proxy_manager_service import (
+    build_proxy_url,
+    is_proxy_error_message,
+    proxy_display_name,
+    proxy_manager_service,
+)
 from services.register import openai_register
 
 
@@ -33,7 +39,16 @@ def _normalize(raw: dict) -> dict:
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
-    cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    legacy_proxy = str(cfg.get("proxy") or "").strip()
+    raw_proxy_ids = cfg.get("proxy_ids")
+    if isinstance(raw_proxy_ids, list):
+        proxy_ids = [str(item or "").strip() for item in raw_proxy_ids if str(item or "").strip()]
+    else:
+        proxy_id = str(cfg.get("proxy_id") or "").strip()
+        proxy_ids = [proxy_id] if proxy_id else []
+    cfg["proxy"] = legacy_proxy
+    cfg["proxy_id"] = proxy_ids[0] if proxy_ids else ""
+    cfg["proxy_ids"] = list(dict.fromkeys(proxy_ids))
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -47,6 +62,11 @@ class RegisterService:
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
+        self._proxy_condition = threading.Condition(self._lock)
+        self._runtime_proxy_ids: set[str] = set()
+        self._busy_proxy_ids: set[str] = set()
+        self._bad_proxy_ids: set[str] = set()
+        self._proxy_index = 0
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -69,7 +89,7 @@ class RegisterService:
     def update(self, updates: dict) -> dict:
         with self._lock:
             self._config = _normalize({**self._config, **updates})
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_id", "proxy_ids", "total", "threads")})
             self._save()
             return self.get()
 
@@ -83,13 +103,15 @@ class RegisterService:
             self._logs = []
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "proxy_id", "proxy_ids", "total", "threads")})
+            self._init_runtime_proxies_locked()
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
-            self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
+            proxy_count = len(self._runtime_proxy_ids)
+            self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}，代理数={proxy_count}", "yellow")
             return self.get()
 
     def stop(self) -> dict:
@@ -97,6 +119,7 @@ class RegisterService:
             self._config["enabled"] = False
             self._config["stats"]["updated_at"] = _now()
             self._save()
+            self._proxy_condition.notify_all()
             self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
             return self.get()
 
@@ -113,6 +136,57 @@ class RegisterService:
         with self._lock:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
+
+    def _init_runtime_proxies_locked(self) -> None:
+        selected = [item["id"] for item in proxy_manager_service.get_private_many(self._config.get("proxy_ids") or [])]
+        self._runtime_proxy_ids = set(selected)
+        self._busy_proxy_ids = set()
+        self._bad_proxy_ids = set()
+        self._proxy_index = 0
+        missing = [item for item in (self._config.get("proxy_ids") or []) if item not in self._runtime_proxy_ids]
+        if missing:
+            self._append_log(f"已忽略 {len(missing)} 个不存在的注册代理", "yellow")
+
+    def _acquire_proxy(self) -> dict | None:
+        with self._proxy_condition:
+            if not self._config.get("enabled"):
+                return None
+            candidates = [
+                proxy_id
+                for proxy_id in (self._config.get("proxy_ids") or [])
+                if proxy_id in self._runtime_proxy_ids
+                and proxy_id not in self._busy_proxy_ids
+                and proxy_id not in self._bad_proxy_ids
+            ]
+            if candidates:
+                proxy_id = candidates[self._proxy_index % len(candidates)]
+                self._proxy_index += 1
+                self._busy_proxy_ids.add(proxy_id)
+                proxy = proxy_manager_service.get_private(proxy_id)
+                if proxy is None:
+                    self._busy_proxy_ids.discard(proxy_id)
+                    self._bad_proxy_ids.add(proxy_id)
+                    return None
+                return proxy
+            if self._runtime_proxy_ids and self._runtime_proxy_ids <= self._bad_proxy_ids:
+                self._append_log("所有选中的注册代理都已标记错误，停止注册任务", "red")
+                self._config["enabled"] = False
+                self._save()
+                self._proxy_condition.notify_all()
+            return None
+
+    def _release_proxy(self, proxy_id: str, *, failed: bool = False, error: str = "", display_name: str = "") -> None:
+        proxy_id = str(proxy_id or "").strip()
+        if not proxy_id:
+            return
+        with self._proxy_condition:
+            self._busy_proxy_ids.discard(proxy_id)
+            if failed:
+                self._bad_proxy_ids.add(proxy_id)
+                proxy_manager_service.mark_runtime_error(proxy_id, error)
+                label = display_name or proxy_id
+                self._append_log(f"代理 {label} 运行异常，已标记错误并从本次注册任务中移除：{error}", "red")
+            self._proxy_condition.notify_all()
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
@@ -160,11 +234,25 @@ class RegisterService:
         submitted, done, success, fail = 0, 0, 0, 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
+            future_proxies: dict[object, dict] = {}
             while True:
                 cfg = self.get()
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                    selected_proxy_ids = [str(item or "").strip() for item in (cfg.get("proxy_ids") or []) if str(item or "").strip()]
+                    proxy = self._acquire_proxy() if selected_proxy_ids else None
+                    if selected_proxy_ids and proxy is None:
+                        break
                     submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted))
+                    future = executor.submit(
+                        openai_register.worker,
+                        submitted,
+                        build_proxy_url(proxy) if proxy else "",
+                        str(proxy.get("id") or "") if proxy else "",
+                    )
+                    futures.add(future)
+                    future_proxies[future] = proxy or {}
+                    if proxy:
+                        self._append_log(f"任务{submitted} 使用代理 {proxy_display_name(proxy)}", "yellow")
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
@@ -173,17 +261,34 @@ class RegisterService:
                     continue
                 finished, futures = wait(futures, return_when=FIRST_COMPLETED)
                 for future in finished:
+                    proxy = future_proxies.pop(future, {})
                     done += 1
                     try:
                         result = future.result()
-                        success += 1 if result.get("ok") else 0
-                        fail += 0 if result.get("ok") else 1
-                    except Exception:
+                        ok = bool(result.get("ok"))
+                        success += 1 if ok else 0
+                        fail += 0 if ok else 1
+                        error = str(result.get("error") or "")
+                        self._release_proxy(
+                            str(proxy.get("id") or ""),
+                            failed=not ok and is_proxy_error_message(error),
+                            error=error,
+                            display_name=proxy_display_name(proxy) if proxy else "",
+                        )
+                    except Exception as exc:
                         fail += 1
+                        error = str(exc) or "worker exception"
+                        self._release_proxy(
+                            str(proxy.get("id") or ""),
+                            failed=is_proxy_error_message(error),
+                            error=error,
+                            display_name=proxy_display_name(proxy) if proxy else "",
+                        )
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
             self._config["enabled"] = False
             self._save()
+            self._proxy_condition.notify_all()
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
 

@@ -14,6 +14,8 @@ from services.register_service import register_service
 class RegisterConfigRequest(BaseModel):
     mail: dict | None = None
     proxy: str | None = None
+    proxy_id: str | None = None
+    proxy_ids: list[str] | None = None
     total: int | None = None
     threads: int | None = None
     mode: str | None = None

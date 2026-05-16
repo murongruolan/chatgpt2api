@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from threading import Condition, Lock
 from typing import Any
 from datetime import datetime
@@ -24,6 +25,7 @@ class AccountService:
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
+        self._request_proxies = threading.local()
 
     def _load_accounts(self) -> dict[str, dict]:
         accounts = self.storage.load_accounts()
@@ -64,6 +66,7 @@ class AccountService:
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
         normalized["restore_at"] = normalized.get("restore_at") or None
+        normalized["register_proxy_id"] = str(normalized.get("register_proxy_id") or "").strip()
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
@@ -192,11 +195,12 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
-    def add_accounts(self, tokens: list[str]) -> dict:
+    def add_accounts(self, tokens: list[str], register_proxy_id: str = "") -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))
         if not tokens:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
 
+        register_proxy_id = str(register_proxy_id or "").strip()
         with self._lock:
             added = 0
             skipped = 0
@@ -212,6 +216,7 @@ class AccountService:
                         **current,
                         "access_token": access_token,
                         "type": str(current.get("type") or "free"),
+                        **({"register_proxy_id": register_proxy_id} if register_proxy_id else {}),
                     }
                 )
                 if account is not None:
@@ -297,13 +302,44 @@ class AccountService:
             return dict(account)
         return None
 
+    def get_account_proxy_url(self, access_token: str) -> str:
+        account = self.get_account(access_token)
+        proxy_id = str((account or {}).get("register_proxy_id") or "").strip()
+        if not proxy_id:
+            return ""
+        try:
+            from services.proxy_manager_service import proxy_manager_service
+            return proxy_manager_service.get_proxy_url(proxy_id)
+        except Exception:
+            return ""
+
+    def set_request_proxy_url(self, access_token: str, proxy_url: str) -> None:
+        mapping = getattr(self._request_proxies, "value", None)
+        if not isinstance(mapping, dict):
+            mapping = {}
+            self._request_proxies.value = mapping
+        token = str(access_token or "").strip()
+        if token:
+            mapping[token] = str(proxy_url or "").strip()
+
+    def clear_request_proxy_url(self, access_token: str) -> None:
+        mapping = getattr(self._request_proxies, "value", None)
+        if isinstance(mapping, dict):
+            mapping.pop(str(access_token or "").strip(), None)
+
+    def current_request_proxy_url(self, access_token: str) -> str:
+        mapping = getattr(self._request_proxies, "value", None)
+        if not isinstance(mapping, dict):
+            return ""
+        return str(mapping.get(str(access_token or "").strip()) or "").strip()
+
     def fetch_remote_info(self, access_token: str, event: str = "fetch_remote_info") -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(access_token).get_user_info()
+            result = OpenAIBackendAPI(access_token, proxy_url=self.get_account_proxy_url(access_token)).get_user_info()
         except InvalidAccessTokenError:
             self.remove_invalid_token(access_token, event)
             raise

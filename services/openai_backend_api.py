@@ -52,7 +52,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", proxy_url: str = "") -> None:
         """初始化后端客户端。
 
         参数：
@@ -62,16 +62,24 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
+        self.proxy_url = str(proxy_url or "").strip()
+        if not self.proxy_url and self.access_token:
+            try:
+                self.proxy_url = account_service.current_request_proxy_url(self.access_token) or account_service.get_account_proxy_url(self.access_token)
+            except Exception:
+                self.proxy_url = ""
         self.fp = self._build_fp()
         self.user_agent = self.fp["user-agent"]
         self.device_id = self.fp["oai-device-id"]
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
-            impersonate=self.fp["impersonate"],
-            verify=True,
-        ))
+        session_kwargs = {"impersonate": self.fp["impersonate"], "verify": True}
+        if self.proxy_url:
+            session_kwargs["proxy"] = self.proxy_url
+        else:
+            session_kwargs = proxy_settings.build_session_kwargs(**session_kwargs)
+        self.session = requests.Session(**session_kwargs)
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,

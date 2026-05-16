@@ -33,13 +33,15 @@ config = {
         "providers": [],
     },
     "proxy": "",
+    "proxy_id": "",
+    "proxy_ids": [],
     "total": 10,
     "threads": 3,
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
+    config.update({key: saved_config[key] for key in ("mail", "proxy", "proxy_id", "proxy_ids", "total", "threads") if key in saved_config})
 except Exception:
     pass
 
@@ -138,17 +140,33 @@ def _generate_pkce() -> tuple[str, str]:
     return code_verifier, code_challenge
 
 
+# def _random_password(length: int = 16) -> str:
+#     chars = string.ascii_letters + string.digits + "!@#$%"
+#     value = list(
+#         secrets.choice(string.ascii_uppercase)
+#         + secrets.choice(string.ascii_lowercase)
+#         + secrets.choice(string.digits)
+#         + secrets.choice("!@#$%")
+#         + "".join(secrets.choice(chars) for _ in range(max(0, length - 4)))
+#     )
+#     random.shuffle(value)
+#     return "".join(value)
 def _random_password(length: int = 16) -> str:
-    chars = string.ascii_letters + string.digits + "!@#$%"
-    value = list(
-        secrets.choice(string.ascii_uppercase)
-        + secrets.choice(string.ascii_lowercase)
-        + secrets.choice(string.digits)
-        + secrets.choice("!@#$%")
-        + "".join(secrets.choice(chars) for _ in range(max(0, length - 4)))
-    )
-    random.shuffle(value)
-    return "".join(value)
+    # 字符池：仅保留大小写字母和数字，避开可能导致传输转义失败的特殊字符
+    chars = string.ascii_letters + string.digits
+
+    while True:
+        # 1. 完全随机抽取：每次直接从完整字符池中选取，彻底消除排列规律
+        password = "".join(secrets.choice(chars) for _ in range(length))
+
+        # 2. 自然复杂度校验：依靠概率自然生成，不再进行人工拼接
+        has_upper = any(c.isupper() for c in password)
+        has_lower = any(c.islower() for c in password)
+        has_digit = any(c.isdigit() for c in password)
+
+        # 3. 满足基础要求（大写+小写+数字）即返回，特殊字符不再是必选项
+        if has_upper and has_lower and has_digit:
+            return password
 
 
 def _random_name() -> tuple[str, str]:
@@ -180,12 +198,12 @@ def _decode_jwt_payload(token: str) -> dict:
         return {}
 
 
-def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(config["mail"], username)
+def create_mailbox(username: str | None = None, proxy: str = "") -> dict:
+    return mail_provider.create_mailbox(config["mail"], username, proxy=proxy)
 
 
-def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(config["mail"], mailbox)
+def wait_for_code(mailbox: dict, proxy: str = "") -> str | None:
+    return mail_provider.wait_for_code(config["mail"], mailbox, proxy=proxy)
 
 
 class SentinelTokenGenerator:
@@ -394,26 +412,30 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
     return extract_oauth_callback_params_from_url(str(org_resp.headers.get("Location") or "").strip())
 
 
-def exchange_platform_tokens(session: requests.Session, device_id: str, code_verifier: str, consent_url: str) -> dict | None:
+def exchange_platform_tokens(session: requests.Session, device_id: str, code_verifier: str, consent_url: str, proxy: str = "") -> dict | None:
     callback_params = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
     if not callback_params:
         return None
     code = str(callback_params.get("code") or "").strip()
     if not code:
         return None
-    resp = create_session(config["proxy"]).post(
-        f"{auth_base}/oauth/token",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "client_id": platform_oauth_client_id,
-            "code_verifier": code_verifier,
-        },
-        verify=False,
-        timeout=60,
-    )
+    token_session = create_session(proxy)
+    try:
+        resp = token_session.post(
+            f"{auth_base}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "client_id": platform_oauth_client_id,
+                "code_verifier": code_verifier,
+            },
+            verify=False,
+            timeout=60,
+        )
+    finally:
+        token_session.close()
     data = _response_json(resp)
     if resp.status_code != 200 or not data.get("access_token") or not data.get("refresh_token") or not data.get("id_token"):
         return None
@@ -427,7 +449,9 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
 
 
 class PlatformRegistrar:
-    def __init__(self, proxy: str = "") -> None:
+    def __init__(self, proxy: str = "", proxy_id: str = "") -> None:
+        self.proxy = str(proxy or "").strip()
+        self.proxy_id = str(proxy_id or "").strip()
         self.session = create_session(proxy)
         self.device_id = str(uuid.uuid4())
 
@@ -546,14 +570,14 @@ class PlatformRegistrar:
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "password_verify")
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
         if resp is None or resp.status_code != 200:
-            raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')}")
+            raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')} p:{password}")
         step(index, "密码校验完成")
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or "").strip()
         page_type = str(((payload.get("page") or {}).get("type")) or "")
         if page_type == "email_otp_verification" or "email-verification" in continue_url or "email-otp" in continue_url:
             step(index, "独立登录需要邮箱验证码")
-            code = wait_for_code(mailbox)
+            code = wait_for_code(mailbox, self.proxy)
             if not code:
                 raise RuntimeError("独立登录等待验证码超时")
             resp, reason = validate_otp(self.session, self.device_id, code)
@@ -567,7 +591,7 @@ class PlatformRegistrar:
             step(index, "独立登录验证码校验完成")
         if not continue_url:
             continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
-        tokens = exchange_platform_tokens(self.session, self.device_id, code_verifier, continue_url)
+        tokens = exchange_platform_tokens(self.session, self.device_id, code_verifier, continue_url, self.proxy)
         if not tokens:
             raise RuntimeError("token换取失败")
         step(index, "token 换取完成")
@@ -575,7 +599,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox()
+        mailbox = create_mailbox(proxy=self.proxy)
         email = str(mailbox.get("address") or "").strip()
         if not email:
             raise RuntimeError("邮箱服务未返回 address")
@@ -586,7 +610,7 @@ class PlatformRegistrar:
         self._register_user(email, password, index)
         self._send_otp(index)
         step(index, "开始等待注册验证码")
-        code = wait_for_code(mailbox)
+        code = wait_for_code(mailbox, self.proxy)
         if not code:
             raise RuntimeError("等待注册验证码超时")
         step(index, f"收到注册验证码: {code}")
@@ -599,19 +623,22 @@ class PlatformRegistrar:
             "access_token": str(tokens.get("access_token") or "").strip(),
             "refresh_token": str(tokens.get("refresh_token") or "").strip(),
             "id_token": str(tokens.get("id_token") or "").strip(),
+            "register_proxy_id": self.proxy_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
 
-def worker(index: int) -> dict:
+def worker(index: int, proxy: str = "", proxy_id: str = "") -> dict:
     start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
+    selected_proxy = str(proxy or "").strip()
+    selected_proxy_id = str(proxy_id or "").strip()
+    registrar = PlatformRegistrar(selected_proxy, selected_proxy_id)
     try:
-        step(index, "任务启动")
+        step(index, f"任务启动{f'，代理ID={selected_proxy_id}' if selected_proxy_id else ''}")
         result = registrar.register(index)
         cost = time.time() - start
         access_token = str(result["access_token"])
-        account_service.add_accounts([access_token])
+        account_service.add_accounts([access_token], register_proxy_id=selected_proxy_id)
         account_service.refresh_accounts([access_token])
         with stats_lock:
             stats["done"] += 1

@@ -488,6 +488,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         if token:
             attempted_tokens.add(token)
         try:
+            account_service.set_request_proxy_url(token, account_service.get_account_proxy_url(token))
             active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
                 if event.get("type") != "conversation.delta":
@@ -506,6 +507,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if token:
                     continue
             raise
+        finally:
+            account_service.clear_request_proxy_url(token)
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -605,6 +608,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             returned_message = False
             returned_result = False
             try:
+                account_service.set_request_proxy_url(token, account_service.get_account_proxy_url(token))
                 backend = OpenAIBackendAPI(access_token=token)
                 for output in stream_image_outputs(backend, request, index, request.n):
                     if output.kind == "message" and request.message_as_error:
@@ -635,6 +639,8 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                     account_service.remove_invalid_token(token, "image_stream")
                     continue
                 raise ImageGenerationError(image_stream_error_message(last_error)) from exc
+            finally:
+                account_service.clear_request_proxy_url(token)
 
     if not emitted:
         raise ImageGenerationError(image_stream_error_message(last_error))

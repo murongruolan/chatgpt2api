@@ -1,13 +1,18 @@
 "use client";
 
-import { AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Square, Trash2, UserPlus } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, Check, ChevronsUpDown, LoaderCircle, Plus, Play, RotateCcw, Save, Square, Trash2, UserPlus } from "lucide-react";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { fetchManagedProxies, type ManagedProxy } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
 import { useSettingsStore } from "../../settings/store";
 
@@ -15,7 +20,7 @@ export function RegisterCard() {
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
   const isSaving = useSettingsStore((state) => state.isSavingRegister);
-  const setProxy = useSettingsStore((state) => state.setRegisterProxy);
+  const setProxyIds = useSettingsStore((state) => state.setRegisterProxyIds);
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
   const setMode = useSettingsStore((state) => state.setRegisterMode);
@@ -29,6 +34,27 @@ export function RegisterCard() {
   const save = useSettingsStore((state) => state.saveRegister);
   const toggle = useSettingsStore((state) => state.toggleRegister);
   const reset = useSettingsStore((state) => state.resetRegister);
+  const [proxies, setProxies] = useState<ManagedProxy[]>([]);
+  const [proxyOpen, setProxyOpen] = useState(false);
+  const proxyMap = useMemo(() => new Map(proxies.map((proxy) => [proxy.id, proxy])), [proxies]);
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const data = await fetchManagedProxies();
+        if (active) {
+          setProxies(data.items);
+        }
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "加载代理列表失败");
+      }
+    };
+    void load();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   if (isLoading) {
     return (
@@ -43,6 +69,21 @@ export function RegisterCard() {
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
+  const selectedProxyIds = config.proxy_ids?.length ? config.proxy_ids : config.proxy_id ? [config.proxy_id] : [];
+  const selectedProxyLabels = selectedProxyIds
+    .map((id) => {
+      const proxy = proxyMap.get(id);
+      return proxy ? (proxy.name || `${proxy.type}://${proxy.host}:${proxy.port}`) : "";
+    })
+    .filter(Boolean);
+  const missingSelectedProxyCount = selectedProxyIds.filter((id) => !proxyMap.has(id)).length;
+  const proxySummary = selectedProxyLabels.length > 0 ? selectedProxyLabels.join("，") : "不使用注册代理";
+  const toggleProxy = (proxyId: string, checked: boolean) => {
+    const next = checked
+      ? Array.from(new Set([...selectedProxyIds, proxyId]))
+      : selectedProxyIds.filter((id) => id !== proxyId);
+    setProxyIds(next);
+  };
   const updateProviderType = (index: number, type: string) => {
     updateProvider(index, {
       type,
@@ -99,7 +140,52 @@ export function RegisterCard() {
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册代理</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+              <Popover open={proxyOpen} onOpenChange={setProxyOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-10 w-full justify-between rounded-xl border-stone-200 bg-white px-3 text-left text-stone-700"
+                    disabled={config.enabled}
+                  >
+                    <span className="truncate">{proxySummary}</span>
+                    <ChevronsUpDown className="size-4 text-stone-400" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="start" className="w-[360px] max-w-[calc(100vw-32px)] p-2">
+                  <div className="max-h-72 space-y-1 overflow-y-auto">
+                    {proxies.length === 0 ? (
+                      <div className="rounded-xl bg-stone-50 px-3 py-4 text-sm text-stone-500">暂无代理，请先到代理管理页添加。</div>
+                    ) : (
+                      proxies.map((proxy) => {
+                        const checked = selectedProxyIds.includes(proxy.id);
+                        const label = proxy.name || `${proxy.type}://${proxy.host}:${proxy.port}`;
+                        return (
+                          <label key={proxy.id} className="flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2 text-sm hover:bg-stone-50">
+                            <Checkbox checked={checked} onCheckedChange={(value) => toggleProxy(proxy.id, Boolean(value))} />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate font-medium text-stone-700">{label}</span>
+                              <span className="block truncate text-xs text-stone-400">{proxy.type}://{proxy.host}:{proxy.port}</span>
+                            </span>
+                            {checked ? <Check className="size-4 text-emerald-600" /> : null}
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                  {selectedProxyIds.length > 0 ? (
+                    <div className="mt-2 border-t border-stone-100 pt-2">
+                      <Button type="button" variant="ghost" className="h-8 w-full rounded-lg text-stone-500" onClick={() => setProxyIds([])}>
+                        清空选择
+                      </Button>
+                    </div>
+                  ) : null}
+                </PopoverContent>
+              </Popover>
+              <p className={cn("text-xs", selectedProxyIds.length > 0 ? "text-stone-500" : "text-amber-600")}>
+                已选 {selectedProxyIds.length} 个。注册任务会独占轮换使用，代理不足时线程等待释放。
+                {missingSelectedProxyCount > 0 ? ` ${missingSelectedProxyCount} 个已删除代理启动时会被忽略。` : ""}
+              </p>
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">目标剩余额度</label>

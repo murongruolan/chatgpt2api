@@ -10,6 +10,7 @@ from email import message_from_string, policy
 from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any, Callable, TypeVar
+from urllib.parse import urlparse
 
 import requests
 from curl_cffi import requests as curl_requests
@@ -22,13 +23,43 @@ domain_index = 0
 provider_index = 0
 
 
-def _config(mail_config: dict) -> dict:
+def _config(mail_config: dict, proxy: str = "") -> dict:
     return {
         "request_timeout": float(mail_config.get("request_timeout") or 30),
         "wait_timeout": float(mail_config.get("wait_timeout") or 30),
         "wait_interval": float(mail_config.get("wait_interval") or 2),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
+        "proxy": str(proxy or mail_config.get("proxy") or "").strip(),
     }
+
+
+def _is_socks_proxy(proxy: str) -> bool:
+    candidate = str(proxy or "").strip().lower()
+    return candidate.startswith("socks5://") or candidate.startswith("socks5h://")
+
+
+def _is_valid_proxy_url(proxy: str) -> bool:
+    parsed = urlparse(str(proxy or "").strip())
+    return parsed.scheme in {"http", "https", "socks5", "socks5h"} and bool(parsed.netloc)
+
+
+def _new_requests_session(conf: dict):
+    proxy = str(conf.get("proxy") or "").strip()
+    if proxy and _is_socks_proxy(proxy):
+        return curl_requests.Session(impersonate="chrome", proxy=proxy)
+    session = requests.Session()
+    session.trust_env = False
+    if proxy and _is_valid_proxy_url(proxy):
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
+
+
+def _new_curl_session(conf: dict):
+    proxy = str(conf.get("proxy") or "").strip()
+    kwargs = {"impersonate": "chrome"}
+    if proxy and _is_valid_proxy_url(proxy):
+        kwargs["proxy"] = proxy
+    return curl_requests.Session(**kwargs)
 
 
 def _random_mailbox_name() -> str:
@@ -208,7 +239,7 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
-        self.session = curl_requests.Session(impersonate="chrome")
+        self.session = _new_curl_session(conf)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
         resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
@@ -248,8 +279,7 @@ class TempMailLolProvider(BaseMailProvider):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_key = str(entry.get("api_key") or "").strip()
         self.domain = [str(item).strip() for item in (entry.get("domain") or []) if str(item).strip()]
-        self.session = requests.Session()
-        self.session.trust_env = False
+        self.session = _new_requests_session(conf)
         self.session.headers.update({"User-Agent": conf["user_agent"], "Accept": "application/json", "Content-Type": "application/json"})
         if self.api_key:
             self.session.headers["Authorization"] = f"Bearer {self.api_key}"
@@ -307,8 +337,7 @@ class DuckMailProvider(BaseMailProvider):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_key = str(entry["api_key"]).strip()
         self.default_domain = str(entry.get("default_domain") or "duckmail.sbs").strip() or "duckmail.sbs"
-        self.session = requests.Session()
-        self.session.trust_env = False
+        self.session = _new_requests_session(conf)
         self.session.headers.update({"User-Agent": conf["user_agent"], "Accept": "application/json", "Content-Type": "application/json"})
 
     def _request(self, method: str, path: str, token: str = "", use_api_key: bool = False, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)):
@@ -358,8 +387,7 @@ class GptMailProvider(BaseMailProvider):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_key = str(entry["api_key"]).strip()
         self.default_domain = str(entry.get("default_domain") or "").strip()
-        self.session = requests.Session()
-        self.session.trust_env = False
+        self.session = _new_requests_session(conf)
         self.session.headers.update({"User-Agent": conf["user_agent"], "Accept": "application/json", "Content-Type": "application/json", "X-API-Key": self.api_key})
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None):
@@ -402,7 +430,7 @@ class MoEmailProvider(BaseMailProvider):
         else:
             self.domain = [str(raw_domains).strip()] if str(raw_domains).strip() else []
         self.expiry_time = int(entry.get("expiry_time") or 0)
-        self.session = curl_requests.Session(impersonate="chrome")
+        self.session = _new_curl_session(conf)
 
     def _request(self, method: str, path: str, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
         resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"X-API-Key": self.api_key, "Content-Type": "application/json", "User-Agent": self.conf["user_agent"]}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
@@ -456,8 +484,7 @@ class InbucketMailProvider(BaseMailProvider):
         else:
             self.domain = [str(raw_domains).strip()] if str(raw_domains).strip() else []
         self.random_subdomain = bool(entry.get("random_subdomain", True))
-        self.session = requests.Session()
-        self.session.trust_env = False
+        self.session = _new_requests_session(conf)
         self.session.headers.update({
             "User-Agent": conf["user_agent"],
             "Accept": "application/json",
@@ -557,8 +584,7 @@ class YydsMailProvider(BaseMailProvider):
         self.domain = [str(item).strip() for item in (entry.get("domain") or []) if str(item).strip()]
         self.subdomain = str(entry.get("subdomain") or "").strip()
         self.wildcard = bool(entry.get("wildcard"))
-        self.session = requests.Session()
-        self.session.trust_env = False
+        self.session = _new_requests_session(conf)
         self.session.headers.update({"User-Agent": conf["user_agent"], "Accept": "application/json", "Content-Type": "application/json"})
 
     def _request(self, method: str, path: str, token: str = "", params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)):
@@ -631,10 +657,10 @@ def _next_entry(mail_config: dict) -> dict:
         return value
 
 
-def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "") -> BaseMailProvider:
+def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "", proxy: str = "") -> BaseMailProvider:
     entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
     entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
-    conf = _config(mail_config)
+    conf = _config(mail_config, proxy)
     if entry["type"] == "cloudflare_temp_email":
         return CloudflareTempMailProvider(entry, conf)
     if entry["type"] == "tempmail_lol":
@@ -652,16 +678,16 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
-def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
-    provider = _create_provider(mail_config)
+def create_mailbox(mail_config: dict, username: str | None = None, proxy: str = "") -> dict:
+    provider = _create_provider(mail_config, proxy=proxy)
     try:
         return provider.create_mailbox(username)
     finally:
         provider.close()
 
 
-def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
-    provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
+def wait_for_code(mail_config: dict, mailbox: dict, proxy: str = "") -> str | None:
+    provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""), proxy=proxy)
     try:
         return provider.wait_for_code(mailbox)
     finally:

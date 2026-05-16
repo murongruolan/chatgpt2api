@@ -210,7 +210,9 @@ function AccountsPageContent() {
     const normalizedQuery = query.trim().toLowerCase();
     return accounts.filter((account) => {
       const searchMatched =
-        normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
+        normalizedQuery.length === 0
+        || (account.email ?? "").toLowerCase().includes(normalizedQuery)
+        || (account.register_proxy_id ?? "").toLowerCase().includes(normalizedQuery);
       const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
       const statusMatched = statusFilter === "all" || account.status === statusFilter;
       return searchMatched && typeMatched && statusMatched;
@@ -589,7 +591,7 @@ function AccountsPageContent() {
             </div>
 
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[920px] text-left">
+              <table className="w-full min-w-[1040px] text-left">
                 <thead className="border-b border-stone-100 text-[11px] text-stone-400 uppercase tracking-[0.18em]">
                   <tr>
                     <th className="w-12 px-4 py-3">
@@ -602,6 +604,7 @@ function AccountsPageContent() {
                     <th className="w-28 px-4 py-3">类型</th>
                     <th className="w-24 px-4 py-3">状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
+                    <th className="w-36 px-4 py-3">注册代理</th>
                     <th className="w-24 px-4 py-3">额度</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
                     <th className="w-18 px-4 py-3">成功</th>
@@ -664,6 +667,15 @@ function AccountsPageContent() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
+                        </td>
+                        <td className="px-4 py-3">
+                          {account.register_proxy_id ? (
+                            <Badge variant="outline" className="rounded-md font-mono text-[11px]">
+                              {account.register_proxy_id.slice(0, 8)}
+                            </Badge>
+                          ) : (
+                            <span className="text-xs text-stone-400">全局/无</span>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant="info" className="rounded-md">

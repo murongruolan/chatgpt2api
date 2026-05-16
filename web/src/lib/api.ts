@@ -10,6 +10,7 @@ export type Account = {
   type: AccountType;
   status: AccountStatus;
   quota: number;
+  register_proxy_id?: string;
   image_quota_unknown?: boolean;
   email?: string | null;
   user_id?: string | null;
@@ -209,6 +210,8 @@ export type RegisterConfig = {
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;
+  proxy_id?: string;
+  proxy_ids?: string[];
   total: number;
   threads: number;
   mode: "total" | "quota" | "available";
@@ -742,5 +745,86 @@ export async function testProxy(url?: string) {
   return httpRequest<{ result: ProxyTestResult }>("/api/proxy/test", {
     method: "POST",
     body: { url: url ?? "" },
+  });
+}
+
+// ── Proxy manager ─────────────────────────────────────────────────
+
+export type ManagedProxyType = "http" | "https" | "socks5";
+
+export type ManagedProxyTestResult = {
+  ok: boolean;
+  status: "success" | "failed" | "testing" | string;
+  latency_ms: number | null;
+  region: string;
+  ip: string;
+  tested_at: string;
+  source?: "ip-api" | "httpbin" | string;
+  error?: string | null;
+  country?: string;
+  country_code?: string;
+  region_name?: string;
+  city?: string;
+  isp?: string;
+};
+
+export type ManagedProxy = {
+  id: string;
+  name: string;
+  type: ManagedProxyType;
+  host: string;
+  port: number;
+  username: string;
+  testing: boolean;
+  has_password: boolean;
+  last_test: ManagedProxyTestResult | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ManagedProxyPayload = {
+  name?: string;
+  type: ManagedProxyType;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+};
+
+export async function fetchManagedProxies() {
+  return httpRequest<{ items: ManagedProxy[] }>("/api/proxies");
+}
+
+export async function createManagedProxy(proxy: ManagedProxyPayload) {
+  return httpRequest<{ item: ManagedProxy; items: ManagedProxy[] }>("/api/proxies", {
+    method: "POST",
+    body: proxy,
+  });
+}
+
+export async function batchCreateManagedProxies(text: string) {
+  return httpRequest<{ added: number; errors: Array<{ line: number; text: string; error: string }>; items: ManagedProxy[] }>("/api/proxies/batch", {
+    method: "POST",
+    body: { text },
+  });
+}
+
+export async function updateManagedProxy(proxyId: string, proxy: ManagedProxyPayload) {
+  return httpRequest<{ item: ManagedProxy; items: ManagedProxy[] }>(`/api/proxies/${proxyId}`, {
+    method: "POST",
+    body: proxy,
+  });
+}
+
+export async function deleteManagedProxy(proxyId: string) {
+  return httpRequest<{ items: ManagedProxy[] }>(`/api/proxies/${proxyId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function testManagedProxies(ids: string[]) {
+  return httpRequest<{ started: number; items: ManagedProxy[] }>("/api/proxies/test", {
+    method: "POST",
+    body: { ids },
   });
 }

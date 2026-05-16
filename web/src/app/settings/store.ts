@@ -34,6 +34,20 @@ export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
 
+function normalizeRegisterConfig(config: RegisterConfig): RegisterConfig {
+  const legacyProxyId = typeof config.proxy_id === "string" ? config.proxy_id.trim() : "";
+  const proxyIds = Array.isArray(config.proxy_ids)
+    ? config.proxy_ids.map((item) => String(item || "").trim()).filter(Boolean)
+    : legacyProxyId ? [legacyProxyId] : [];
+  const uniqueProxyIds = Array.from(new Set(proxyIds));
+  return {
+    ...config,
+    proxy: "",
+    proxy_id: uniqueProxyIds[0] || "",
+    proxy_ids: uniqueProxyIds,
+  };
+}
+
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
   const backup = typeof config.backup === "object" && config.backup
     ? config.backup as BackupSettings
@@ -186,7 +200,7 @@ type SettingsStore = {
 
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
-  setRegisterProxy: (value: string) => void;
+  setRegisterProxyIds: (value: string[]) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterMode: (value: "total" | "quota" | "available") => void;
@@ -534,7 +548,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!silent) set({ isLoadingRegister: true });
     try {
       const data = await fetchRegisterConfig();
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
     } catch (error) {
       if (!silent) toast.error(error instanceof Error ? error.message : "加载注册配置失败");
     } finally {
@@ -543,11 +557,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setRegisterConfig: (config) => {
-    set({ registerConfig: config, isLoadingRegister: false });
+    set({ registerConfig: normalizeRegisterConfig(config), isLoadingRegister: false });
   },
 
-  setRegisterProxy: (value) => {
-    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {});
+  setRegisterProxyIds: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy_ids: value, proxy_id: value[0] || "", proxy: "" } } : {});
   },
 
   setRegisterTotal: (value) => {
@@ -626,7 +640,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({ isSavingRegister: true });
       const data = await updateRegisterConfig({
         mail: registerConfig.mail,
-        proxy: registerConfig.proxy.trim(),
+        proxy: "",
+        proxy_ids: registerConfig.proxy_ids || [],
         total: Math.max(1, Number(registerConfig.total) || 1),
         threads: Math.max(1, Number(registerConfig.threads) || 1),
         mode: registerConfig.mode,
@@ -634,7 +649,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         target_available: Math.max(1, Number(registerConfig.target_available) || 1),
         check_interval: Math.max(1, Number(registerConfig.check_interval) || 5),
       });
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
       toast.success("注册配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存注册配置失败");
@@ -651,7 +666,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       if (!registerConfig.enabled) {
         await updateRegisterConfig({
           mail: registerConfig.mail,
-          proxy: registerConfig.proxy.trim(),
+          proxy: "",
+          proxy_ids: registerConfig.proxy_ids || [],
           total: Math.max(1, Number(registerConfig.total) || 1),
           threads: Math.max(1, Number(registerConfig.threads) || 1),
           mode: registerConfig.mode,
@@ -661,7 +677,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         });
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
       toast.success(registerConfig.enabled ? "注册任务已停止" : "注册任务已启动");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "切换注册状态失败");
@@ -674,7 +690,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetRegisterApi();
-      set({ registerConfig: data.register });
+      set({ registerConfig: normalizeRegisterConfig(data.register) });
       toast.success("注册统计已重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置注册统计失败");
